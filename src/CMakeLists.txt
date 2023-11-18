@@ -19,3 +19,7 @@ target_link_libraries(DXR d3d12 dxcompiler dxgi d3dcompiler)
 add_custom_command(TARGET DXR POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_LIST_DIR}/../Shaders ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>/Shaders
 )
+
+add_custom_command(TARGET DXR POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_directory ${CMAKE_CURRENT_LIST_DIR}/../Libs/dxc/bin/x64 ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/$<CONFIG>
+)

@@ -38,6 +38,8 @@ int Win32Application::Run(Application* pSample, HINSTANCE hInstance, int nCmdSho
 		hInstance,
 		pSample);
 
+	Application* sample = reinterpret_cast<Application*>(GetWindowLongPtr(m_hwnd, GWLP_USERDATA));
+
 	// Initialize the sample. OnInit is defined in each child-implementation of DXSample.
 	pSample->OnInit();
 

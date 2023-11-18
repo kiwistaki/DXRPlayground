@@ -2,6 +2,8 @@
 #include "DXRSample.h"
 #include "nv_helpers_dx12/DXRHelper.h"
 #include "nv_helpers_dx12/BottomLevelASGenerator.h"
+#include "nv_helpers_dx12/RaytracingPipelineGenerator.h"   
+#include "nv_helpers_dx12/RootSignatureGenerator.h"
 #include <stdexcept>
 
 DXRSample::DXRSample(UINT width, UINT height, std::string name) :
@@ -18,9 +20,14 @@ void DXRSample::OnInit()
 	LoadPipeline();
 	LoadAssets();
 
+	// DXR
 	CheckRaytracingSupport();
-
+	CreateAccelerationStructures();
 	ThrowIfFailed(m_commandList->Close());
+	CreateRaytracingPipeline();
+	CreateRaytracingOutputBuffer();
+	CreateShaderResourceHeap();
+	CreateShaderBindingTable();
 }
 
 void DXRSample::LoadPipeline()
@@ -48,7 +55,7 @@ void DXRSample::LoadPipeline()
 
 		ThrowIfFailed(D3D12CreateDevice(
 			warpAdapter.Get(),
-			D3D_FEATURE_LEVEL_12_1,
+			D3D_FEATURE_LEVEL_12_2,
 			IID_PPV_ARGS(&m_device)
 			));
 	}
@@ -59,7 +66,7 @@ void DXRSample::LoadPipeline()
 
 		ThrowIfFailed(D3D12CreateDevice(
 			hardwareAdapter.Get(),
-			D3D_FEATURE_LEVEL_11_0,
+			D3D_FEATURE_LEVEL_12_2,
 			IID_PPV_ARGS(&m_device)
 			));
 	}
@@ -185,9 +192,9 @@ void DXRSample::LoadAssets()
 	{
 		Vertex triangleVertices[] =
 		{
-			{ { 0.0f, 0.25f * m_aspectRatio, 0.0f }, { 1.0f, 0.0f, 0.0f, 1.0f } },
-			{ { 0.25f, -0.25f * m_aspectRatio, 0.0f }, { 0.0f, 1.0f, 0.0f, 1.0f } },
-			{ { -0.25f, -0.25f * m_aspectRatio, 0.0f }, { 0.0f, 0.0f, 1.0f, 1.0f } }
+			{ { 0.0f, 0.25f * m_aspectRatio, 0.0f }, { 1.0f, 1.0f, 0.0f, 1.0f } },
+			{ { 0.25f, -0.25f * m_aspectRatio, 0.0f }, { 0.0f, 1.0f, 1.0f, 1.0f } },
+			{ { -0.25f, -0.25f * m_aspectRatio, 0.0f }, { 1.0f, 0.0f, 1.0f, 1.0f } }
 		};
 
 		const UINT vertexBufferSize = sizeof(triangleVertices);
@@ -270,8 +277,52 @@ void DXRSample::PopulateCommandList()
 		}
 		else
 		{
-			const float clearColor[] = { 0.6f, 0.8f, 0.4f, 1.0f };
-			m_commandList->ClearRenderTargetView(rtvHandle, clearColor, 0, nullptr);
+			std::vector<ID3D12DescriptorHeap*> heaps = { m_srvUavHeap.Get() };
+			m_commandList->SetDescriptorHeaps(static_cast<UINT>(heaps.size()), heaps.data());
+
+			CD3DX12_RESOURCE_BARRIER transition = CD3DX12_RESOURCE_BARRIER::Transition(
+				m_outputResource.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE,
+				D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+			m_commandList->ResourceBarrier(1, &transition);
+
+			D3D12_DISPATCH_RAYS_DESC desc = {};
+			//RayGen
+			uint32_t rayGenerationSectionSizeInBytes = m_sbtHelper.GetRayGenSectionSize();
+			desc.RayGenerationShaderRecord.StartAddress = m_sbtStorage->GetGPUVirtualAddress();
+			desc.RayGenerationShaderRecord.SizeInBytes = rayGenerationSectionSizeInBytes;
+			//Miss
+			uint32_t missSectionSizeInBytes = m_sbtHelper.GetMissSectionSize();
+			desc.MissShaderTable.StartAddress = m_sbtStorage->GetGPUVirtualAddress() + rayGenerationSectionSizeInBytes;
+			desc.MissShaderTable.SizeInBytes = missSectionSizeInBytes;
+			desc.MissShaderTable.StrideInBytes = m_sbtHelper.GetMissEntrySize();
+			//HitGroup
+			uint32_t hitGroupsSectionSize = m_sbtHelper.GetHitGroupSectionSize();
+			desc.HitGroupTable.StartAddress = m_sbtStorage->GetGPUVirtualAddress() + rayGenerationSectionSizeInBytes + missSectionSizeInBytes;
+			desc.HitGroupTable.SizeInBytes = hitGroupsSectionSize;
+			desc.HitGroupTable.StrideInBytes = m_sbtHelper.GetHitGroupEntrySize();
+			desc.Width = GetWidth();
+			desc.Height = GetHeight();
+			desc.Depth = 1;
+
+			m_commandList->SetPipelineState1(m_rtStateObject.Get());
+			m_commandList->DispatchRays(&desc);
+
+			transition = CD3DX12_RESOURCE_BARRIER::Transition(
+				m_outputResource.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+				D3D12_RESOURCE_STATE_COPY_SOURCE);
+			m_commandList->ResourceBarrier(1, &transition);
+			transition = CD3DX12_RESOURCE_BARRIER::Transition(
+				m_renderTargets[m_frameIndex].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET,
+				D3D12_RESOURCE_STATE_COPY_DEST);
+			m_commandList->ResourceBarrier(1, &transition);
+
+			m_commandList->CopyResource(m_renderTargets[m_frameIndex].Get(),
+				m_outputResource.Get());
+
+			transition = CD3DX12_RESOURCE_BARRIER::Transition(
+				m_renderTargets[m_frameIndex].Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+				D3D12_RESOURCE_STATE_RENDER_TARGET);
+			m_commandList->ResourceBarrier(1, &transition);
 		}
 	}
 	m_commandList->ResourceBarrier(1, &CD3DX12_RESOURCE_BARRIER::Transition(m_renderTargets[m_frameIndex].Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_PRESENT));
@@ -304,26 +355,15 @@ void DXRSample::CheckRaytracingSupport()
 AccelerationStructureBuffers DXRSample::CreateBottomLevelAS(std::vector<std::pair<ComPtr<ID3D12Resource>, uint32_t>> vVertexBuffers, std::vector<std::pair<ComPtr<ID3D12Resource>, uint32_t>> vIndexBuffers)
 {
 	nv_helpers_dx12::BottomLevelASGenerator bottomLevelAS;
-
-	// Adding all vertex buffers and not transforming their position.
 	for (const auto& buffer : vVertexBuffers)
 	{
 		bottomLevelAS.AddVertexBuffer(buffer.first.Get(), 0, buffer.second, sizeof(Vertex), 0, 0);
 	}
 
-	// The AS build requires some scratch space to store temporary information.
-  // The amount of scratch memory is dependent on the scene complexity.
 	UINT64 scratchSizeInBytes = 0;
-	// The final AS also needs to be stored in addition to the existing vertex
-	// buffers. It size is also dependent on the scene complexity.
 	UINT64 resultSizeInBytes = 0;
+	bottomLevelAS.ComputeASBufferSizes(m_device.Get(), false, &scratchSizeInBytes, &resultSizeInBytes);
 
-	bottomLevelAS.ComputeASBufferSizes(m_device.Get(), false, &scratchSizeInBytes,
-		&resultSizeInBytes);
-
-	// Once the sizes are obtained, the application is responsible for allocating
-	// the necessary buffers. Since the entire generation will be done on the GPU,
-	// we can directly allocate those on the default heap
 	AccelerationStructureBuffers buffers;
 	buffers.pScratch = nv_helpers_dx12::CreateBuffer(
 		m_device.Get(), scratchSizeInBytes,
@@ -335,9 +375,6 @@ AccelerationStructureBuffers DXRSample::CreateBottomLevelAS(std::vector<std::pai
 		D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
 		nv_helpers_dx12::kDefaultHeapProps);
 
-	// Build the acceleration structure. Note that this call integrates a barrier
-	// on the generated AS, so that it can be used to compute a top-level AS right
-	// after this method.
 	bottomLevelAS.Generate(m_commandList.Get(), buffers.pScratch.Get(),
 		buffers.pResult.Get(), false, nullptr);
 
@@ -346,10 +383,180 @@ AccelerationStructureBuffers DXRSample::CreateBottomLevelAS(std::vector<std::pai
 
 void DXRSample::CreateTopLevelAS(const std::vector<std::pair<ComPtr<ID3D12Resource>, DirectX::XMMATRIX>>& instances, bool updateOnly)
 {
+	// Gather all the instances into the builder helper
+	for (size_t i = 0; i < instances.size(); i++)
+	{
+		m_topLevelASGenerator.AddInstance(
+			instances[i].first.Get(), instances[i].second, 
+			static_cast<UINT>(i), static_cast<UINT>(0));
+	}
+
+	UINT64 scratchSize, resultSize, instanceDescsSize;
+	m_topLevelASGenerator.ComputeASBufferSizes(m_device.Get(), true, &scratchSize,
+		&resultSize, &instanceDescsSize);
+
+	m_topLevelASBuffers.pScratch = nv_helpers_dx12::CreateBuffer(
+		m_device.Get(), scratchSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+		D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+		nv_helpers_dx12::kDefaultHeapProps);
+	m_topLevelASBuffers.pResult = nv_helpers_dx12::CreateBuffer(
+		m_device.Get(), resultSize, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+		D3D12_RESOURCE_STATE_RAYTRACING_ACCELERATION_STRUCTURE,
+		nv_helpers_dx12::kDefaultHeapProps);
+
+	m_topLevelASBuffers.pInstanceDesc = nv_helpers_dx12::CreateBuffer(
+		m_device.Get(), instanceDescsSize, D3D12_RESOURCE_FLAG_NONE,
+		D3D12_RESOURCE_STATE_GENERIC_READ, nv_helpers_dx12::kUploadHeapProps);
+
+	m_topLevelASGenerator.Generate(m_commandList.Get(),
+		m_topLevelASBuffers.pScratch.Get(),
+		m_topLevelASBuffers.pResult.Get(),
+		m_topLevelASBuffers.pInstanceDesc.Get());
 }
 
 void DXRSample::CreateAccelerationStructures()
 {
+	// Build the bottom AS from the Triangle vertex buffer
+	AccelerationStructureBuffers bottomLevelBuffers = CreateBottomLevelAS({ {m_vertexBuffer.Get(), 3} });
+
+	// Just one instance for now
+	m_instances = { {bottomLevelBuffers.pResult, XMMatrixIdentity()} };
+	CreateTopLevelAS(m_instances);
+
+	// Flush the command list and wait for it to finish
+	m_commandList->Close();
+	ID3D12CommandList* ppCommandLists[] = { m_commandList.Get() };
+	m_commandQueue->ExecuteCommandLists(1, ppCommandLists);
+	m_fenceValue++;
+	m_commandQueue->Signal(m_fence.Get(), m_fenceValue);
+
+	m_fence->SetEventOnCompletion(m_fenceValue, m_fenceEvent);
+	WaitForSingleObject(m_fenceEvent, INFINITE);
+
+	ThrowIfFailed(m_commandList->Reset(m_commandAllocator.Get(), m_pipelineState.Get()));
+	m_bottomLevelAS = bottomLevelBuffers.pResult;
+}
+
+ComPtr<ID3D12RootSignature> DXRSample::CreateRayGenSignature()
+{
+	nv_helpers_dx12::RootSignatureGenerator rsc;
+	rsc.AddHeapRangesParameter(
+		{ {0 /*u0*/, 1 /*1 descriptor */, 0 /*use the implicit register space 0*/,
+		  D3D12_DESCRIPTOR_RANGE_TYPE_UAV /* UAV representing the output buffer*/,
+		  0 /*heap slot where the UAV is defined*/},
+		 {0 /*t0*/, 1, 0,
+		  D3D12_DESCRIPTOR_RANGE_TYPE_SRV /*Top-level acceleration structure*/,
+		  1} });
+
+	return rsc.Generate(m_device.Get(), true);
+}
+
+ComPtr<ID3D12RootSignature> DXRSample::CreateMissSignature()
+{
+	nv_helpers_dx12::RootSignatureGenerator rsc;
+	return rsc.Generate(m_device.Get(), true);
+}
+
+ComPtr<ID3D12RootSignature> DXRSample::CreateHitSignature()
+{
+	nv_helpers_dx12::RootSignatureGenerator rsc;
+	rsc.AddRootParameter(D3D12_ROOT_PARAMETER_TYPE_SRV);
+	return rsc.Generate(m_device.Get(), true);
+}
+
+void DXRSample::CreateRaytracingPipeline()
+{
+	nv_helpers_dx12::RayTracingPipelineGenerator pipeline(m_device.Get());
+
+	m_rayGenLibrary = nv_helpers_dx12::CompileShaderLibrary(L"Shaders/RayGen.hlsl");
+	m_missLibrary = nv_helpers_dx12::CompileShaderLibrary(L"Shaders/Miss.hlsl");
+	m_hitLibrary = nv_helpers_dx12::CompileShaderLibrary(L"Shaders/Hit.hlsl");
+
+	pipeline.AddLibrary(m_rayGenLibrary.Get(), { L"RayGen" });
+	pipeline.AddLibrary(m_missLibrary.Get(), { L"Miss" });
+	pipeline.AddLibrary(m_hitLibrary.Get(), { L"ClosestHit" });
+
+	m_rayGenSignature = CreateRayGenSignature();
+	m_missSignature = CreateMissSignature();
+	m_hitSignature = CreateHitSignature();
+
+	pipeline.AddHitGroup(L"HitGroup", L"ClosestHit");
+
+	pipeline.AddRootSignatureAssociation(m_rayGenSignature.Get(), { L"RayGen" });
+	pipeline.AddRootSignatureAssociation(m_missSignature.Get(), { L"Miss" });
+	pipeline.AddRootSignatureAssociation(m_hitSignature.Get(), { L"HitGroup" });
+
+	pipeline.SetMaxPayloadSize(4 * sizeof(float)); // RGB + distance
+	// The actual barycentrics can be obtained using float3 barycentrics = float3(1.f-u-v, u, v);
+	pipeline.SetMaxAttributeSize(2 * sizeof(float)); // barycentric coordinates
+	pipeline.SetMaxRecursionDepth(1);
+
+	// Compile the pipeline for execution on the GPU
+	m_rtStateObject = pipeline.Generate();
+	ThrowIfFailed(m_rtStateObject->QueryInterface(IID_PPV_ARGS(&m_rtStateObjectProps)));
+}
+
+void DXRSample::CreateRaytracingOutputBuffer()
+{
+	D3D12_RESOURCE_DESC resDesc = {};
+	resDesc.DepthOrArraySize = 1;
+	resDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	resDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	resDesc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+	resDesc.Width = GetWidth();
+	resDesc.Height = GetHeight();
+	resDesc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	resDesc.MipLevels = 1;
+	resDesc.SampleDesc.Count = 1;
+	ThrowIfFailed(m_device->CreateCommittedResource(
+		&nv_helpers_dx12::kDefaultHeapProps, D3D12_HEAP_FLAG_NONE, &resDesc,
+		D3D12_RESOURCE_STATE_COPY_SOURCE, nullptr,
+		IID_PPV_ARGS(&m_outputResource)));
+}
+
+void DXRSample::CreateShaderResourceHeap()
+{
+	m_srvUavHeap = nv_helpers_dx12::CreateDescriptorHeap(
+		m_device.Get(), 2, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, true);
+
+	D3D12_CPU_DESCRIPTOR_HANDLE srvHandle = m_srvUavHeap->GetCPUDescriptorHandleForHeapStart();
+
+	D3D12_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
+	uavDesc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+	m_device->CreateUnorderedAccessView(m_outputResource.Get(), nullptr, &uavDesc, srvHandle);
+
+	srvHandle.ptr += m_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+	D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc;
+	srvDesc.Format = DXGI_FORMAT_UNKNOWN;
+	srvDesc.ViewDimension = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE;
+	srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	srvDesc.RaytracingAccelerationStructure.Location = m_topLevelASBuffers.pResult->GetGPUVirtualAddress();
+	m_device->CreateShaderResourceView(nullptr, &srvDesc, srvHandle);
+}
+
+void DXRSample::CreateShaderBindingTable()
+{
+	m_sbtHelper.Reset();
+
+	D3D12_GPU_DESCRIPTOR_HANDLE srvUavHeapHandle = m_srvUavHeap->GetGPUDescriptorHandleForHeapStart();
+	auto heapPointer = reinterpret_cast<UINT64*>(srvUavHeapHandle.ptr);
+
+	m_sbtHelper.AddRayGenerationProgram(L"RayGen", { heapPointer });
+	m_sbtHelper.AddMissProgram(L"Miss", {});
+	m_sbtHelper.AddHitGroup(L"HitGroup", { (void*)(m_vertexBuffer->GetGPUVirtualAddress()) });
+	uint32_t sbtSize = m_sbtHelper.ComputeSBTSize();
+
+	m_sbtStorage = nv_helpers_dx12::CreateBuffer(
+		m_device.Get(), sbtSize, D3D12_RESOURCE_FLAG_NONE,
+		D3D12_RESOURCE_STATE_GENERIC_READ, nv_helpers_dx12::kUploadHeapProps);
+
+	if (!m_sbtStorage)
+	{
+		throw std::logic_error("Could not allocate the shader binding table");
+	}
+
+	m_sbtHelper.Generate(m_sbtStorage.Get(), m_rtStateObjectProps.Get());
 }
 
 void DXRSample::OnKeyUp(UINT8 key)
